@@ -758,6 +758,18 @@ static gboolean progress_callback (gpointer loop) {
             display_progress(rtptime_start, rtptime, rtptime_end);
             rtptime_prev = rtptime;
         }
+#ifdef AIRBRIDGE_CORE
+        /* iOS sends SET_PARAMETER progress only occasionally.  The RTP
+         * timestamp advances with the audio stream, so derive a smooth
+         * position here every second while audio packets are arriving. */
+        if (rtptime_start || rtptime_end) {
+            double ab_position = (rtptime >= rtptime_start)
+                ? (double) (rtptime - rtptime_start) / 44100.0 : 0.0;
+            double ab_duration = (rtptime_end > rtptime_start)
+                ? (double) (rtptime_end - rtptime_start) / 44100.0 : 0.0;
+            airbridge_emit_progress(ab_position, ab_duration);
+        }
+#endif
         if (render_coverart && coverart_artist == "_expired_" && rtptime - rtptime_coverart_expired > 44100 * 5) {
             /* remove any expired coverart still being rendered more than 5 secs after it expired */ 
             coverart_artist.erase();
