@@ -33,6 +33,7 @@
 #include <iostream>
 #include <memory>
 #include <iterator>
+#include <atomic>
 #include <sys/stat.h>
 #include <cstdio>
 #include <stdarg.h>
@@ -73,6 +74,9 @@
 #ifdef DBUS
 #include <dbus/dbus.h>
 #endif
+#ifdef AIRBRIDGE_CORE
+#include "airbridge_core.h"
+#endif
 
 
 #define VERSION "1.74"
@@ -97,6 +101,13 @@
 static const char *appname = DEFAULT_NAME;
 static std::string server_name = appname;
 static bool server_name_is_utf8 = false;
+#ifdef AIRBRIDGE_CORE
+static std::string airbridge_receiver_name_override;
+static std::string airbridge_meta_title;
+static std::string airbridge_meta_artist;
+static std::string airbridge_meta_album;
+static bool airbridge_mirror_running = false;
+#endif
 static dnssd_t *dnssd = NULL;
 static raop_t *raop = NULL;
 static logger_t *render_logger = NULL;
@@ -209,6 +220,51 @@ static std::string ble_filename = "";
 static std::string rtp_pipeline = "";
 static std::string audio_rtp_pipeline = "";
 static GMainLoop *gmainloop = NULL;
+#ifdef AIRBRIDGE_CORE
+static std::atomic<bool> airbridge_stop_requested{false};
+/* True while an HLS (YouTube app) video is being played.  The HLS player
+ * fetches its playlists through UxPlay's own HTTP server, and those local
+ * connections also invoke conn_init().  Without this flag they would flip
+ * the UI back to "connected" right after on_video_play() reported "hls". */
+static bool airbridge_hls_running = false;
+
+static void airbridge_clear_now_playing(void) {
+    airbridge_meta_title.clear();
+    airbridge_meta_artist.clear();
+    airbridge_meta_album.clear();
+    track_title.clear();
+    track_album.clear();
+    artist.clear();
+    coverart_artist.clear();
+    airbridge_emit_metadata(NULL, NULL, NULL);
+    airbridge_emit_progress(0.0, 0.0);
+}
+
+extern "C" void airbridge_engine_request_stop(void) {
+    airbridge_stop_requested.store(true);
+    relaunch_video = false;
+    airbridge_emit_log(2, "AirBridge: stop requested");
+    if (gmainloop) {
+        /* g_main_loop_quit() may block when called from another thread while
+         * the loop thread is inside a source callback.  Queue the quit on the
+         * loop's own context instead and return immediately. */
+        g_main_context_invoke(NULL, [](gpointer data) -> gboolean {
+            airbridge_emit_log(2, "AirBridge: quitting GLib main loop");
+            relaunch_video = false;
+            g_main_loop_quit(static_cast<GMainLoop *>(data));
+            return G_SOURCE_REMOVE;
+        }, gmainloop);
+    }
+}
+
+extern "C" void airbridge_engine_set_receiver_name(const char *utf8_name) {
+    if (utf8_name) {
+        airbridge_receiver_name_override.assign(utf8_name);
+    } else {
+        airbridge_receiver_name_override.clear();
+    }
+}
+#endif
 static bool mux_to_file = false;
 static std::string mux_filename = "recording";
 static bool raspberry_pi_hls_support = false;
@@ -271,6 +327,23 @@ static std::string execCommand(const std::string& cmd) {
 static void log(int level, const char* format, ...) {
     va_list vargs;
     if (level > log_level) return;
+#ifdef AIRBRIDGE_CORE
+    char buffer[2048];
+    va_start(vargs, format);
+    vsnprintf(buffer, sizeof(buffer), format, vargs);
+    va_end(vargs);
+    int ab_level;
+    if (level <= LOGGER_ERR) {
+        ab_level = 0;
+    } else if (level == LOGGER_WARNING) {
+        ab_level = 1;
+    } else if (level <= LOGGER_INFO) {
+        ab_level = 2;
+    } else {
+        ab_level = 3;
+    }
+    airbridge_emit_log(ab_level, buffer);
+#else
     switch (level) {
     case 0:
     case 1:
@@ -288,6 +361,7 @@ static void log(int level, const char* format, ...) {
     vprintf(format, vargs);
     printf("\n");
     va_end(vargs);
+#endif
 }
 
 #define LOGD(...) log(LOGGER_DEBUG, __VA_ARGS__)
@@ -794,6 +868,14 @@ static void main_loop()  {
 
 #ifdef _WIN32
     gmainloop = loop;
+#ifdef AIRBRIDGE_CORE
+    if (airbridge_stop_requested.load()) {
+        g_idle_add([](gpointer data) -> gboolean {
+            g_main_loop_quit(static_cast<GMainLoop *>(data));
+            return G_SOURCE_REMOVE;
+        }, loop);
+    }
+#endif
 #else 
     signal(SIGINT, SIG_DFL);
     signal(SIGTERM, SIG_DFL);
@@ -830,6 +912,7 @@ static void main_loop()  {
 #endif
 
     g_main_loop_run(loop);
+    LOGI("AirBridge: GLib main loop returned");
 
 #ifdef _WIN32
     gmainloop = NULL;
@@ -2173,6 +2256,9 @@ static void process_metadata(int count, const char *dmap_tag, const unsigned cha
                 break;
             case 'l':
                 metadata_text->append("Album: ");  /*asal*/
+#ifdef AIRBRIDGE_CORE
+                airbridge_meta_album.assign((const char *) metadata, datalen);
+#endif
                 if (render_coverart) {
                     track_album.erase();
                     track_album.append(metadata, metadata + datalen);
@@ -2180,6 +2266,9 @@ static void process_metadata(int count, const char *dmap_tag, const unsigned cha
                 break;
             case 'r':
                 metadata_text->append("Artist: ");  /*asar*/
+#ifdef AIRBRIDGE_CORE
+                airbridge_meta_artist.assign((const char *) metadata, datalen);
+#endif
                 if (render_coverart) {
                     artist.erase();
                     artist.append(metadata, metadata + datalen);
@@ -2260,6 +2349,9 @@ static void process_metadata(int count, const char *dmap_tag, const unsigned cha
     } else if (strcmp (dmap_tag, "minm") == 0) {
         dmap_type = 9;
         metadata_text->append("Title: ");
+#ifdef AIRBRIDGE_CORE
+        airbridge_meta_title.assign((const char *) metadata, datalen);
+#endif
         if (render_coverart) {
             track_title.erase();
             track_title.append(metadata, metadata + datalen);
@@ -2571,6 +2663,34 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
         g_assert(FALSE);
         break;
     }
+#ifdef AIRBRIDGE_CORE
+    switch (type) {
+    case RESET_TYPE_NOHOLD:
+        airbridge_hls_running = false;
+        airbridge_clear_now_playing();
+        airbridge_emit_state("idle");
+        break;
+    case RESET_TYPE_HLS_EOS:
+        airbridge_hls_running = false;
+        airbridge_clear_now_playing();
+        airbridge_emit_state("connected");
+        break;
+    case RESET_TYPE_ON_VIDEO_PLAY:
+        airbridge_hls_running = true;
+        airbridge_clear_now_playing();
+        airbridge_emit_state("hls");
+        break;
+    case RESET_TYPE_RTP_TO_HLS_TEARDOWN:
+    case RESET_TYPE_RTP_SHUTDOWN:
+    case RESET_TYPE_HLS_SHUTDOWN:
+        airbridge_hls_running = false;
+        airbridge_clear_now_playing();
+        airbridge_emit_state(open_connections == 0 ? "idle" : "connected");
+        break;
+    default:
+        break;
+    }
+#endif
     reset_loop = true;
 }
 
@@ -2586,6 +2706,10 @@ extern "C" int video_set_codec(void *cls, video_codec_t codec) {
 }
 
 extern "C" void display_pin(void *cls, char *pin) {
+#ifdef AIRBRIDGE_CORE
+    airbridge_emit_pin(pin);
+    return;
+#else
     int margin = 10;
     int spacing = 3;
     char *image = create_pin_display(pin, margin, spacing);
@@ -2595,6 +2719,7 @@ extern "C" void display_pin(void *cls, char *pin) {
         LOGI("%s\n",image);     
         free (image);
     }
+#endif
 }
 
 extern "C" const char *passwd(void *cls, int *len){
@@ -2622,8 +2747,17 @@ extern "C" void export_dacp(void *cls, const char *active_remote, const char *da
 }
 
 extern "C" void conn_init (void *cls) {
+    bool new_session = (open_connections == 0);
     open_connections++;
     LOGD("Open connections: %i", open_connections);
+#ifdef AIRBRIDGE_CORE
+    if (new_session && !airbridge_hls_running) {
+        /* A new AirPlay session starts: discard metadata from the previous
+         * track/device so especially HLS video does not keep showing it. */
+        airbridge_clear_now_playing();
+        airbridge_emit_state("connected");
+    }
+#endif
     //video_renderer_update_background(1);
 }
 
@@ -2642,6 +2776,11 @@ extern "C" void conn_destroy (void *cls) {
         if (mux_to_file) {
             mux_renderer_stop();
         }
+#ifdef AIRBRIDGE_CORE
+        airbridge_hls_running = false;
+        airbridge_clear_now_playing();
+        airbridge_emit_state("idle");
+#endif
     }
 }
 
@@ -2668,6 +2807,13 @@ extern "C" void conn_reset (void *cls, int reason) {
     reset_httpd = true;
     relaunch_video = true;
     reset_loop = true;
+#ifdef AIRBRIDGE_CORE
+    if (reason == 1) {
+        airbridge_emit_error(1, "lost connection with client");
+    } else if (reason == 2) {
+        airbridge_emit_error(2, "unsupported HLS streaming source");
+    }
+#endif
 }
 
 extern "C" void report_client_request(void *cls, char *deviceid, char * model, char *name, bool * admit) {
@@ -2689,6 +2835,9 @@ extern "C" void report_client_request(void *cls, char *deviceid, char * model, c
     if (*admit && use_video) {
         video_renderer_set_device_model(model, name);
     }
+#ifdef AIRBRIDGE_CORE
+    airbridge_emit_client(name, model, deviceid);
+#endif
 }
 
 extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *data) {
@@ -2752,14 +2901,21 @@ extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *
     }
 }
 
-#ifdef DBUS
 extern "C" void mirror_video_running  (void *cls, bool is_running) {
+#ifdef AIRBRIDGE_CORE
+    airbridge_mirror_running = is_running;
+    if (is_running) {
+        airbridge_hls_running = false;
+    }
+    airbridge_emit_state(is_running ? "mirror" : "connected");
+#endif
+#ifdef DBUS
     if (scrsv != 1) {
         return;
     }
     dbus_screensaver_inhibiter(is_running);
-}
 #endif
+}
 
 extern "C" void video_pause (void *cls) {
     if (use_video) {
@@ -2837,8 +2993,17 @@ extern "C" void audio_set_volume (void *cls, float volume) {
     }
     audio_renderer_set_volume(gst_volume);
     video_renderer_hls_set_volume(gst_volume);
+#ifdef AIRBRIDGE_CORE
+    airbridge_emit_volume((double) volume, gst_volume);
+#endif
     LOGI("AirPlay volume %.1f dB (slider %.0f%%): GStreamer volume %.3f", (double) volume, 100.0 * frac, gst_volume);
 }
+
+#ifdef AIRBRIDGE_CORE
+extern "C" void airbridge_engine_set_volume(double db) {
+    audio_set_volume(NULL, (float) db);
+}
+#endif
 
 extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *spf, bool *usingScreen, bool *isMedia, uint64_t *audioFormat) {
     unsigned char type;
@@ -2879,10 +3044,22 @@ extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *
 extern "C" void video_report_size(void *cls, float *width_source, float *height_source, float *width, float *height) {
     if (use_video) {
         video_renderer_size(width_source, height_source, width, height);
+#ifdef AIRBRIDGE_CORE
+        airbridge_emit_video_size((int) *width, (int) *height);
+        if (*width > 0 && *height > 0 && !airbridge_mirror_running) {
+            airbridge_mirror_running = true;
+            airbridge_emit_state("mirror");
+        }
+#endif
     }
 }
 
 extern "C" void audio_set_coverart(void *cls, const void *buffer, int buflen) {
+#ifdef AIRBRIDGE_CORE
+    if (buffer && buflen > 0) {
+        airbridge_emit_artwork((const unsigned char *) buffer, buflen);
+    }
+#endif
     if (buffer && coverart_filename.length()) {
         write_coverart(coverart_filename.c_str(), buffer, buflen);
         LOGI("coverart size %d written to %s", buflen,  coverart_filename.c_str());
@@ -2903,6 +3080,11 @@ extern "C" void audio_set_progress(void *cls, uint32_t *start, uint32_t *curr, u
     rtptime_start = *start;
     rtptime = *curr;
     rtptime_end = *end;
+#ifdef AIRBRIDGE_CORE
+    double ab_position = (*curr > *start) ? (double) (*curr - *start) / 44100.0 : 0.0;
+    double ab_duration = (*end > *start) ? (double) (*end - *start) / 44100.0 : 0.0;
+    airbridge_emit_progress(ab_position, ab_duration);
+#endif
     display_progress(rtptime_start, rtptime, rtptime_end);
 }
 
@@ -2956,6 +3138,14 @@ extern "C" void audio_set_metadata(void *cls, const void *buffer, int buflen) {
             artist.length() ? artist.c_str() : NULL,
             track_album.length() ? track_album.c_str() : NULL);
     }
+#ifdef AIRBRIDGE_CORE
+    airbridge_emit_metadata(airbridge_meta_title.empty() ? NULL : airbridge_meta_title.c_str(),
+                            airbridge_meta_artist.empty() ? NULL : airbridge_meta_artist.c_str(),
+                            airbridge_meta_album.empty() ? NULL : airbridge_meta_album.c_str());
+    if (!airbridge_mirror_running && !airbridge_hls_running) {
+        airbridge_emit_state("audio");
+    }
+#endif
 }
 
 extern "C" void register_client(void *cls, const char *device_id, const char *client_pk, const char *client_name) {
@@ -3032,6 +3222,11 @@ extern "C" float on_video_playlist_remove (void *cls) {
 
  extern "C" void on_video_stop(void *cls) {
     LOGI("**************************on_video_stop\n");
+#ifdef AIRBRIDGE_CORE
+    airbridge_hls_running = false;
+    airbridge_clear_now_playing();
+    airbridge_emit_state(open_connections == 0 ? "idle" : "connected");
+#endif
     video_renderer_hls_ready();
  }
 
@@ -3044,6 +3239,11 @@ extern "C" void on_video_acquire_playback_info (void *cls, playback_info_t *play
                                                  &playback_info->playback_buffer_full);
     playback_info->ready_to_play = true; //?
     playback_info->playback_likely_to_keep_up = true; //?
+#ifdef AIRBRIDGE_CORE
+    if (playback_info->duration >= 0.0 && playback_info->position >= 0.0) {
+        airbridge_emit_progress(playback_info->position, playback_info->duration);
+    }
+#endif
     
 #ifdef DBUS
     /*  this seems to be  called every second for first 900 secs (15 mins?) of HLS video, and subsequently
@@ -3114,9 +3314,7 @@ static int start_raop_server (unsigned short display[5], unsigned short tcp[3], 
     raop_cbs.export_dacp = export_dacp;
     raop_cbs.video_reset = video_reset;
     raop_cbs.video_set_codec = video_set_codec;
-#ifdef DBUS
     raop_cbs.mirror_video_running = mirror_video_running;
-#endif
     raop_cbs.on_video_play = on_video_play;
     raop_cbs.on_video_scrub = on_video_scrub;
     raop_cbs.on_video_rate = on_video_rate;
@@ -3280,10 +3478,21 @@ int main (int argc, char *argv[]) {
 
 void real_main (int argc, char *argv[]) {
 #else
+#ifdef AIRBRIDGE_CORE
+extern "C" int airbridge_engine_main (int argc, char *argv[]) {
+#else
 int main (int argc, char *argv[]) {
+#endif
 #endif
     std::vector<char> server_hw_addr;
     std::string config_file = "";
+#ifdef AIRBRIDGE_CORE
+    airbridge_stop_requested.store(false);
+    airbridge_hls_running = false;
+    /* parse_arguments() only clears this when -nh is present.  Reset it so a
+     * restart without -nh restores the default "@hostname" suffix. */
+    do_append_hostname = true;
+#endif
 
 #ifdef _WIN32
     /* initialise Windows kernel qpc frequency for recv timestamping */
@@ -3291,10 +3500,12 @@ int main (int argc, char *argv[]) {
 #endif
 
 #ifdef _WIN32
+#ifndef AIRBRIDGE_CORE
     if (!SetConsoleCtrlHandler(CtrlHandler, TRUE)) {
         LOGE("Could not set control handler");
         exit(1);
     }
+#endif
 #else
     signal(SIGINT, CtrlHandler);
     signal(SIGTERM, CtrlHandler);
@@ -3333,6 +3544,7 @@ int main (int argc, char *argv[]) {
             break;
         }
     }
+#ifndef AIRBRIDGE_CORE
     if (rcfile) {
         config_file = rcfile;
     } else {	
@@ -3341,7 +3553,14 @@ int main (int argc, char *argv[]) {
     if (config_file.length()) {
         read_config_file(config_file.c_str(), argv[0]);
     }
+#endif
     parse_arguments (argc, argv);
+#ifdef AIRBRIDGE_CORE
+    if (!airbridge_receiver_name_override.empty()) {
+        server_name = airbridge_receiver_name_override;
+        server_name_is_utf8 = true;
+    }
+#endif
 
 #if !defined(__APPLE__) || !defined(UXPLAY_HAVE_APPLE_P2P)
     if (peer_to_peer) {
@@ -3379,11 +3598,18 @@ int main (int argc, char *argv[]) {
                 std::replace(lang_system.begin(), lang_system.end(), '_', '-');
             }
         }
+#ifdef AIRBRIDGE_CORE
+        if (lang_system.empty()) {
+            lang_system = "en-US";
+        }
+#endif
         g_assert(!lang_system.empty());
     }
 
 #ifdef _WIN32    /*  use utf-8 terminal output; don't buffer stdout in WIN32 when debug_log = false */
+#ifndef AIRBRIDGE_CORE
     SetConsoleOutputCP(CP_UTF8);
+#endif
     if (!debug_log) {
         setbuf(stdout, NULL);
     }
@@ -3563,10 +3789,19 @@ int main (int argc, char *argv[]) {
     if (do_append_hostname) {
         append_hostname(server_name);
     }
+#ifdef AIRBRIDGE_CORE
+    LOGI("AirBridge: AirPlay receiver name \"%s\" (hostname suffix: %s)",
+         server_name.c_str(), do_append_hostname ? "on" : "off");
+#endif
 
     if (!gstreamer_init()) {
         LOGE ("stopping");
+#ifdef AIRBRIDGE_CORE
+        airbridge_emit_error(3, "GStreamer initialization failed");
+        return 1;
+#else
         exit (1);
+#endif
     }
 
     render_logger = logger_init();
@@ -3640,10 +3875,22 @@ int main (int argc, char *argv[]) {
     
     if (start_dnssd(server_hw_addr, server_name)) {
         cleanup();
+#ifdef AIRBRIDGE_CORE
+        airbridge_emit_error(4, "mDNS service registration failed");
+        return 1;
+#else
+        exit(1);
+#endif
     }
     if (start_raop_server(display, tcp, udp, debug_log)) {
         stop_dnssd();
         cleanup();
+#ifdef AIRBRIDGE_CORE
+        airbridge_emit_error(5, "AirPlay server initialization failed");
+        return 1;
+#else
+        exit(1);
+#endif
     }
 
     if (hls_support) {
@@ -3706,18 +3953,28 @@ int main (int argc, char *argv[]) {
     } else {
         LOGI("Stopping RAOP Server...");
         stop_raop_server();
+        LOGI("AirBridge: RAOP server stopped");
         stop_dnssd();
+        LOGI("AirBridge: DNS-SD stopped");
     }
     cleanup();
+    LOGI("AirBridge: cleanup finished");
+#ifdef AIRBRIDGE_CORE
+    airbridge_emit_state("idle");
+    return 0;
+#endif
 }
  
 static void cleanup() {
+    LOGI("AirBridge: cleanup: audio renderer");
     if (use_audio) {
         audio_renderer_destroy();
     }
+    LOGI("AirBridge: cleanup: video renderer");
     if (use_video)  {
         video_renderer_destroy();
     }
+    LOGI("AirBridge: cleanup: logger");
     logger_destroy(render_logger);
     render_logger = NULL;
     if(audio_dumpfile) {
@@ -3749,5 +4006,9 @@ static void cleanup() {
         dbus_connection_unref(dbus_connection);
     }
 #endif
+#ifdef AIRBRIDGE_CORE
+    return;
+#else
     exit(0);
+#endif
 }

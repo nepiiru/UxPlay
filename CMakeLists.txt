@@ -94,6 +94,26 @@ if (DBUS_FOUND)
       target_link_libraries( uxplay ${DBUS_LIBRARY})
 endif()
 
+option(AIRBRIDGE_CORE "Build the AirBridge core shared library" OFF)
+if (AIRBRIDGE_CORE)
+    message(STATUS "Building AirBridge core shared library")
+    add_library(airbridge_core SHARED
+        uxplay.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../airbridge_core/src/airbridge_core.cpp)
+    target_compile_definitions(airbridge_core PRIVATE
+        AIRBRIDGE_CORE
+        AIRBRIDGE_CORE_EXPORTS)
+    target_include_directories(airbridge_core PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../airbridge_core/include)
+    target_link_libraries(airbridge_core PRIVATE renderers airplay)
+    if (DBUS_FOUND)
+        target_link_libraries(airbridge_core PRIVATE ${DBUS_LIBRARY})
+    endif()
+    set_target_properties(airbridge_core PROPERTIES
+        PREFIX ""
+        OUTPUT_NAME "airbridge_core")
+endif()
+
 
 if (ENABLE_ASAN)
     message(STATUS ">>> FORCING SYSTEM-WIDE UNOPTIMIZED (-O0) ADDRESS SANITIZER BLOCKS <<<")
